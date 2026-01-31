@@ -1,0 +1,19 @@
+{
+  "base": {
+    "0x49048044d57e1c92a77f79988d21fa8faf74e97e": {"name": "Base Bridge", "type": "BRIDGE", "risk": 1},
+    "0x3154Cf16ccdb4C6d922629664174b904d80F2C35": {"name": "Base Portal", "type": "BRIDGE", "risk": 1},
+    "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc": {"name": "Coinbase Hot Wallet", "type": "CEX", "risk": 1},
+    "0x2B50720473216834B764952047805A2067664D92": {"name": "Binance Hot Wallet", "type": "CEX", "risk": 1},
+    "0x8894e0a0c962cb723c1976a4421c95949be2d4e3": {"name": "Binance Hot Wallet 2", "type": "CEX", "risk": 1},
+    "0xA9D1e08C7793af67e9d92fe308d5697FB81d3E43": {"name": "Coinbase Prime", "type": "CEX", "risk": 1},
+    "0x71660c4005BA85c37ccec55d0C4493E66Fe775d3": {"name": "Coinbase 1", "type": "CEX", "risk": 1},
+    "0x503828976D22510aad0201ac7EC88293211D23Da": {"name": "Coinbase 2", "type": "CEX", "risk": 1}
+  },
+  "solana": {
+    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1": {"name": "Raydium Authority", "type": "DEX", "risk": 1},
+    "AC5RDfQFmDS1deWZosYb21BCfAFBC5a0rcaLe8L6Qf":   {"name": "Solana Foundation", "type": "GOV", "risk": 1},
+    "2ojv9BAiHUjxucEue7WSConRKP3icW5CdaqM9a15A9":   {"name": "Binance Cold Storage", "type": "CEX", "risk": 1},
+    "315i8x7g6j1E2c8a2b5d4e1f7c9e0d1b2a3c4d5e6":     {"name": "Coinbase Hot Wallet", "type": "CEX", "risk": 1},
+    "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM": {"name": "Binance Hot Wallet", "type": "CEX", "risk": 1}
+  }
+}
