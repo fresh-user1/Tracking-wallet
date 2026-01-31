@@ -1,61 +1,68 @@
 import time
 import os
+import json
 import requests
 import psycopg2
 import threading
 from datetime import datetime
 
-# --- KONFIGURASI API KEYS ---
+# --- CONFIG ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 BLOCKSCOUT_API_KEY = os.getenv("BLOCKSCOUT_API_KEY") # Base Primary
 SOLSCAN_API_KEY = os.getenv("SOLSCAN_API_KEY")       # Solana Primary
-BLOCKCHAIR_API_KEY = os.getenv("BLOCKCHAIR_API_KEY") # Eth, BSC, & Backup
+BLOCKCHAIR_API_KEY = os.getenv("BLOCKCHAIR_API_KEY") # Emergency Backup
 
-# --- KONFIGURASI RPC (Jalan Raya) ---
-CHAINS = {
-    'base': {
-        'rpc': "https://base.llamarpc.com",
-        'factory': "0xFDa619b6d20975be80A10332cD39b9a4b0FAa8BB", # BaseSwap
-        'topic': "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
-    },
-    'ethereum': {
-        'rpc': "https://eth.llamarpc.com",
-        'factory': "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f", # Uniswap V2
-        'topic': "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
-    },
-    'bsc': {
-        'rpc': "https://binance.llamarpc.com",
-        'factory': "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73", # PancakeSwap V2
-        'topic': "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
-    }
+# --- LOAD LABELS (WHITELIST) ---
+KNOWN_ENTITIES = {}
+try:
+    with open('labels.json', 'r') as f:
+        KNOWN_ENTITIES = json.load(f)
+    print("✅ Knowledge Base (labels.json) Loaded!")
+except Exception as e:
+    print(f"⚠️ Warning: Gagal load labels.json ({e}). Bot berjalan tanpa whitelist.")
+    KNOWN_ENTITIES = {'base': {}, 'solana': {}}
+
+# --- RPC CONFIG (BASE ONLY) ---
+BASE_CONFIG = {
+    'rpc': "https://base.llamarpc.com",
+    'factory': "0xFDa619b6d20975be80A10332cD39b9a4b0FAa8BB", # BaseSwap
+    'topic': "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
 }
 
-# Counter Error untuk Logika Pindah Jalur (Failover)
+# Error Counter
 FAIL_COUNTS = {'blockscout': 0, 'solscan': 0}
 
-# --- DATABASE FUNCTION ---
-def save_to_db(deployer, funder, amount_usd, risk_score, evidence, chain):
+# --- DATABASE LOGIC ---
+def save_to_db(deployer, funder_info, amount_usd, evidence, chain):
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         
-        # Cek apakah dia sudah ada?
-        cur.execute("SELECT id FROM suspect WHERE address = %s", (funder,))
+        funder_addr = funder_info['address']
+        risk_score = funder_info.get('risk', 3)
+        status_label = funder_info.get('name', 'Detected by Bot')
+        funder_type = funder_info.get('type', 'UNKNOWN')
+
+        # JANGAN UPDATE JADI SCAMMER KALAU SUMBERNYA CEX/BRIDGE/DEX
+        is_safe_entity = funder_type in ['CEX', 'BRIDGE', 'DEX', 'GOV']
+        
+        cur.execute("SELECT id FROM suspect WHERE address = %s", (funder_addr,))
         existing = cur.fetchone()
         timestamp = datetime.utcnow()
         
         if existing:
-            cur.execute("""
-                UPDATE suspect SET risk_score=5, status='Serial Scammer', timestamp=%s 
-                WHERE address=%s
-            """, (timestamp, funder))
-            print(f"[{chain.upper()}] 🔄 UPDATE: {funder} -> Serial Scammer")
+            if not is_safe_entity:
+                cur.execute("""
+                    UPDATE suspect SET risk_score=5, status='Serial Scammer', timestamp=%s 
+                    WHERE address=%s
+                """, (timestamp, funder_addr))
+                print(f"[{chain.upper()}] 🚨 UPDATE: {funder_addr} is now SERIAL SCAMMER (Tier 5)")
         else:
             cur.execute("""
                 INSERT INTO suspect (address, chain, risk_score, impact_usd, status, evidence_link, timestamp)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (funder, chain, risk_score, amount_usd, 'Detected by Bot', evidence, timestamp))
-            print(f"[{chain.upper()}] ✅ NEW: {funder} (Tier {risk_score})")
+            """, (funder_addr, chain, risk_score, amount_usd, status_label, evidence, timestamp))
+            print(f"[{chain.upper()}] ✅ NEW RECORD: {funder_addr} via {status_label}")
             
         conn.commit()
         cur.close()
@@ -63,152 +70,151 @@ def save_to_db(deployer, funder, amount_usd, risk_score, evidence, chain):
     except Exception as e:
         print(f"❌ DB Error: {e}")
 
-# --- FUNGSI TRACING (DATA FETCHER) ---
+# --- TRACING LOGIC ---
 
-def fetch_blockchair(chain_name, address):
-    """
-    Fungsi Cadangan (Backup) & Utama untuk ETH/BSC
-    """
-    # Mapping nama chain agar sesuai format URL Blockchair
-    bc_map = {
-        'base': 'base', # Pastikan plan kamu support base, kalau tidak fungsi ini return 0
-        'ethereum': 'ethereum',
-        'bsc': 'binance-smart-chain',
-        'solana': 'solana'
-    }
-    
-    target = bc_map.get(chain_name)
-    url = f"https://api.blockchair.com/{target}/dashboards/address/{address}?key={BLOCKCHAIR_API_KEY}"
-    
+def check_whitelist(chain, address):
+    if chain in KNOWN_ENTITIES:
+        addr_lower = address.lower()
+        # Loop manual karena key di JSON mungkin uppercase/lowercase campuran
+        for k, v in KNOWN_ENTITIES[chain].items():
+            if k.lower() == addr_lower:
+                return {'address': address, **v}
+    return None
+
+def fetch_blockchair_backup(chain, address):
+    """Hanya dipanggil saat Emergency (API Utama Error)"""
+    bc_chain = 'base' if chain == 'base' else 'solana'
+    url = f"https://api.blockchair.com/{bc_chain}/dashboards/address/{address}?key={BLOCKCHAIR_API_KEY}"
     try:
         res = requests.get(url, timeout=10).json()
         data = res['data'][address]
-        # Ambil saldo USD sebagai indikator impact
-        balance_usd = data['address'].get('balance_usd', 0)
-        return "Unknown_Blockchair_Trace", balance_usd
+        usd = data['address'].get('balance_usd', 0)
+        return {'address': address, 'type': 'UNKNOWN_BC', 'name': 'Unknown (Blockchair)', 'risk': 3}, usd
     except:
         return None, 0
 
-def trace_evm(chain, address):
+def trace_base(address, depth=1):
     global FAIL_COUNTS
     
-    # JIKA BASE: Coba Blockscout Dulu
-    if chain == 'base':
-        # Cek apakah error masih di bawah batas wajar (3x)
-        if FAIL_COUNTS['blockscout'] < 3:
-            url = f"https://base.blockscout.com/api?module=account&action=txlist&address={address}&sort=asc&page=1&offset=5&apikey={BLOCKSCOUT_API_KEY}"
-            try:
-                res = requests.get(url, timeout=10).json()
-                if res['result']:
-                    tx = res['result'][0]
-                    if tx['to'].lower() == address.lower():
-                        FAIL_COUNTS['blockscout'] = 0 # Reset error count karena sukses
-                        return tx['from'], float(tx['value'])/10**18 * 2500 # Asumsi ETH $2500
-            except:
-                FAIL_COUNTS['blockscout'] += 1 # Tambah error count
-                print(f"⚠️ Blockscout Error ({FAIL_COUNTS['blockscout']}/3)")
-        
-        # Jika error > 3x, Lanjut ke bawah (Blockchair)
-        print("⚠️ Failover: Switching Base to Blockchair...")
+    # 1. Cek Whitelist
+    known = check_whitelist('base', address)
+    if known: return known, 0
 
-    # JIKA ETH/BSC/BACKUP BASE: Pakai Blockchair
-    funder, bal_usd = fetch_blockchair(chain, address)
-    return funder if funder else address, bal_usd
+    if depth > 5: return {'address': address, 'type': 'LIMIT', 'name': 'Trace Limit', 'risk': 3}, 0
+
+    # 2. Blockscout (Primary)
+    if FAIL_COUNTS['blockscout'] < 3:
+        url = f"https://base.blockscout.com/api?module=account&action=txlist&address={address}&sort=asc&page=1&offset=10&apikey={BLOCKSCOUT_API_KEY}"
+        try:
+            res = requests.get(url, timeout=10).json()
+            if res.get('result') and isinstance(res['result'], list):
+                FAIL_COUNTS['blockscout'] = 0
+                best_funder = None
+                max_val = 0
+                
+                # Cari Funding Terbesar
+                for tx in res['result']:
+                    if tx['to'].lower() == address.lower():
+                        val = float(tx['value']) / 10**18
+                        if val > max_val:
+                            max_val = val
+                            best_funder = tx['from']
+                
+                if best_funder:
+                    # REKURSIF: Lacak bapaknya
+                    parent_info, _ = trace_base(best_funder, depth + 1)
+                    if parent_info['type'] in ['CEX', 'BRIDGE', 'MIXER']:
+                        return parent_info, max_val
+                    
+                    return {'address': best_funder, 'type': 'EOA', 'name': 'Private Wallet', 'risk': 3}, max_val
+        except:
+            FAIL_COUNTS['blockscout'] += 1
+            print(f"⚠️ Blockscout Fail ({FAIL_COUNTS['blockscout']}/3)")
+
+    # 3. Failover Blockchair
+    print("⚠️ Using Blockchair Backup (Base)...")
+    return fetch_blockchair_backup('base', address)
 
 def trace_solana(address):
     global FAIL_COUNTS
     
-    # Coba SOLSCAN Dulu
+    # 1. Whitelist
+    known = check_whitelist('solana', address)
+    if known: return known, 0
+
+    # 2. Solscan (Primary)
     if FAIL_COUNTS['solscan'] < 3:
         url = f"https://public-api.solscan.io/account/transactions?account={address}&limit=5"
         headers = {"token": SOLSCAN_API_KEY}
         try:
             res = requests.get(url, headers=headers, timeout=10).json()
             if isinstance(res, list) and len(res) > 0:
-                last_tx = res[-1]
-                if 'signer' in last_tx:
-                    FAIL_COUNTS['solscan'] = 0
-                    return last_tx['signer'][0], 0
+                FAIL_COUNTS['solscan'] = 0
+                last = res[-1]
+                if 'signer' in last:
+                    signer = last['signer'][0]
+                    return {'address': signer, 'type': 'EOA', 'name': 'Solana Wallet', 'risk': 3}, 0
         except:
              FAIL_COUNTS['solscan'] += 1
-    
-    # Jika Solscan error, pakai Blockchair
-    print("⚠️ Failover: Switching Solana to Blockchair...")
-    return fetch_blockchair('solana', address)
 
-# --- WORKER UTAMA (MONITORING) ---
+    # 3. Failover Blockchair
+    print("⚠️ Using Blockchair Backup (Solana)...")
+    return fetch_blockchair_backup('solana', address)
 
-def monitor_evm(chain_name):
-    print(f"🚀 Worker Started: {chain_name.upper()}")
-    rpc = CHAINS[chain_name]['rpc']
-    factory = CHAINS[chain_name]['factory']
-    topic = CHAINS[chain_name]['topic']
+# --- WORKER LOOPS ---
+
+def monitor_base():
+    print("🚀 Worker: BASE Network Started")
+    rpc = BASE_CONFIG['rpc']
     
-    # Ambil block awal
     try:
-        curr_blk = int(requests.post(rpc, json={"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}, timeout=10).json()['result'], 16)
-    except: curr_blk = 0
+        curr = int(requests.post(rpc, json={"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}, timeout=10).json()['result'], 16)
+    except: curr = 0
         
     while True:
         try:
-            # Polling Logs dari Blockchain
-            payload = {"jsonrpc":"2.0","method":"eth_getLogs","params":[{"fromBlock": hex(curr_blk), "toBlock": "latest", "address": factory, "topics": [topic]}],"id":1}
+            # Polling Logs
+            payload = {"jsonrpc":"2.0","method":"eth_getLogs","params":[{"fromBlock": hex(curr), "toBlock": "latest", "address": BASE_CONFIG['factory'], "topics": [BASE_CONFIG['topic']]}],"id":1}
             res = requests.post(rpc, json=payload, timeout=10).json()
             
             if 'result' in res and res['result']:
                 for log in res['result']:
-                    # Ambil Deployer
-                    tx_hash = log['transactionHash']
-                    tx_res = requests.post(rpc, json={"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":[tx_hash],"id":1}, timeout=10).json()
+                    tx_h = log['transactionHash']
+                    tx_r = requests.post(rpc, json={"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":[tx_h],"id":1}, timeout=10).json()
                     
-                    if 'result' in tx_res and tx_res['result']:
-                        deployer = tx_res['result']['from']
+                    if 'result' in tx_r and tx_r['result']:
+                        deployer = tx_r['result']['from']
                         token_addr = "0x" + log['topics'][1][26:]
                         
-                        print(f"\n[{chain_name.upper()}] New Token Detected!")
+                        print(f"\n[BASE] New Token: {token_addr}")
                         
-                        # TRACE SUMBER DANA
-                        funder, impact = trace_evm(chain_name, deployer)
+                        # TRACE
+                        funder_info, amount = trace_base(deployer)
                         
-                        # SIMPAN KE DB
-                        risk = 5 if impact > 10000 else 3
-                        evid = f"https://dexscreener.com/{chain_name}/{token_addr}"
-                        save_to_db(deployer, funder, impact, risk, evid, chain_name)
-            
-                # Update Block
+                        # SAVE (Asumsi harga ETH $2500)
+                        evidence = f"https://dexscreener.com/base/{token_addr}"
+                        save_to_db(deployer, funder_info, amount * 2500, evidence, 'base')
+                        
                 latest = int(requests.post(rpc, json={"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}, timeout=10).json()['result'], 16)
-                if latest > curr_blk: curr_blk = latest + 1
+                if latest > curr: curr = latest + 1
             
             time.sleep(5)
-            
         except Exception as e:
-            print(f"[{chain_name}] Loop Error: {e}")
+            print(f"[BASE] Error: {e}")
             time.sleep(10)
 
 def monitor_solana():
-    print("🚀 Worker Started: SOLANA")
-    # Karena Solana susah via RPC biasa, kita gunakan DexScreener API untuk 'polling' token baru
+    print("🚀 Worker: SOLANA Started")
+    # Placeholder Logic: Di production gunakan Helius/Quicknode Webhook untuk real new token
+    # Disini kita sleep biar thread jalan tapi tidak spam error
     while True:
-        try:
-            # Mengambil data token terbaru di Solana
-            url = "https://api.dexscreener.com/latest/dex/tokens/solana" 
-            # (Note: Ini endpoint simplifikasi. Idealnya pakai Helius Webhook untuk real-time)
-            
-            # Placeholder Logic untuk menjaga thread tetap hidup
-            time.sleep(15) 
-        except:
-            time.sleep(15)
+        time.sleep(30)
 
 if __name__ == "__main__":
-    # Jalankan 4 Thread Sekaligus
-    t1 = threading.Thread(target=monitor_evm, args=('base',))
-    t2 = threading.Thread(target=monitor_evm, args=('ethereum',))
-    t3 = threading.Thread(target=monitor_evm, args=('bsc',))
-    t4 = threading.Thread(target=monitor_solana)
+    t_base = threading.Thread(target=monitor_base)
+    t_sol = threading.Thread(target=monitor_solana)
     
-    t1.start()
-    t2.start()
-    t3.start()
-    t4.start()
+    t_base.start()
+    t_sol.start()
     
-    t1.join() # Menjaga agar script tidak mati
+    t_base.join()
