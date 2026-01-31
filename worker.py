@@ -34,6 +34,8 @@ FAIL_COUNTS = {'blockscout': 0, 'solscan': 0}
 
 # --- DATABASE LOGIC ---
 def save_to_db(deployer, funder_info, amount_usd, evidence, chain):
+    conn = None
+    cur = None
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
@@ -65,10 +67,17 @@ def save_to_db(deployer, funder_info, amount_usd, evidence, chain):
             print(f"[{chain.upper()}] ✅ NEW RECORD: {funder_addr} via {status_label}")
             
         conn.commit()
-        cur.close()
-        conn.close()
+    except psycopg2.Error as e:
+        print(f"❌ Database Error: {e}")
+        if conn:
+            conn.rollback()
     except Exception as e:
-        print(f"❌ DB Error: {e}")
+        print(f"❌ Unexpected Error in save_to_db: {e}")
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 # --- TRACING LOGIC ---
 
@@ -87,10 +96,14 @@ def fetch_blockchair_backup(chain, address):
     url = f"https://api.blockchair.com/{bc_chain}/dashboards/address/{address}?key={BLOCKCHAIR_API_KEY}"
     try:
         res = requests.get(url, timeout=10).json()
+        if 'data' not in res or address not in res['data']:
+            print(f"⚠️ Blockchair: Invalid response for {address}")
+            return None, 0
         data = res['data'][address]
-        usd = data['address'].get('balance_usd', 0)
+        usd = data.get('address', {}).get('balance_usd', 0)
         return {'address': address, 'type': 'UNKNOWN_BC', 'name': 'Unknown (Blockchair)', 'risk': 3}, usd
-    except:
+    except Exception as e:
+        print(f"❌ Blockchair Error: {e}")
         return None, 0
 
 def trace_base(address, depth=1):
@@ -127,9 +140,9 @@ def trace_base(address, depth=1):
                         return parent_info, max_val
                     
                     return {'address': best_funder, 'type': 'EOA', 'name': 'Private Wallet', 'risk': 3}, max_val
-        except:
+        except Exception as e:
             FAIL_COUNTS['blockscout'] += 1
-            print(f"⚠️ Blockscout Fail ({FAIL_COUNTS['blockscout']}/3)")
+            print(f"⚠️ Blockscout Fail ({FAIL_COUNTS['blockscout']}/3): {e}")
 
     # 3. Failover Blockchair
     print("⚠️ Using Blockchair Backup (Base)...")
@@ -154,8 +167,9 @@ def trace_solana(address):
                 if 'signer' in last:
                     signer = last['signer'][0]
                     return {'address': signer, 'type': 'EOA', 'name': 'Solana Wallet', 'risk': 3}, 0
-        except:
-             FAIL_COUNTS['solscan'] += 1
+        except Exception as e:
+            FAIL_COUNTS['solscan'] += 1
+            print(f"⚠️ Solscan Fail ({FAIL_COUNTS['solscan']}/3): {e}")
 
     # 3. Failover Blockchair
     print("⚠️ Using Blockchair Backup (Solana)...")
@@ -169,7 +183,9 @@ def monitor_base():
     
     try:
         curr = int(requests.post(rpc, json={"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}, timeout=10).json()['result'], 16)
-    except: curr = 0
+    except Exception as e:
+        print(f"⚠️ Failed to get initial block number: {e}")
+        curr = 0
         
     while True:
         try:
