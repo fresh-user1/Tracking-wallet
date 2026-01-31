@@ -96,10 +96,11 @@ def fetch_blockchair_backup(chain, address):
     url = f"https://api.blockchair.com/{bc_chain}/dashboards/address/{address}?key={BLOCKCHAIR_API_KEY}"
     try:
         res = requests.get(url, timeout=10).json()
-        if 'data' not in res or address not in res['data']:
+        if not isinstance(res, dict) or 'data' not in res or address not in res['data']:
             print(f"⚠️ Blockchair: Invalid response for {address}")
             return None, 0
         data = res['data'][address]
+        # Balance USD is optional in Blockchair response
         usd = data.get('address', {}).get('balance_usd', 0)
         return {'address': address, 'type': 'UNKNOWN_BC', 'name': 'Unknown (Blockchair)', 'risk': 3}, usd
     except Exception as e:
